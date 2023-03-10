@@ -6,7 +6,7 @@ from collections import namedtuple
 from typing import Callable, Optional
 
 import torch
-from cupy.cuda import function
+#from cupy.cuda import function
 from pynvrtc.compiler import Program
 
 _apply_disparity_func_pos: Optional[Callable] = None

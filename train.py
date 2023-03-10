@@ -12,14 +12,7 @@ from utils.reduce import set_random_seed
 from utils.util import adjust_learning_rate, setup_logger
 from utils.losses import computer_loss
 from nets.adapter import Adapter
-
-
-def psnr(img1, img2):
-   mse = np.mean((img1 - img2) ** 2)
-   if mse < 1.0e-10:
-      return 100
-   PIXEL_MAX = 1
-   return 20 * np.log10(PIXEL_MAX / np.sqrt(mse))
+from tqdm import tqdm
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -69,6 +62,8 @@ def train_one_epoch(sample, model, model_optimizer, extra, loss_class, onsuper=T
     item['img_R_transformed'] = img_real_R_transformed
     item["depth"] = sample["depth"].to(cuda_device)
     item["disp"] = sample["disp"].to(cuda_device)
+    item["baseline"] = sample["baseline"].to(cuda_device)
+    item["flocal_length"] = sample["flocal_length"].to(cuda_device)
     if isTrain:
         adapter_optimizer.zero_grad()
         model_optimizer.zero_grad()
@@ -119,9 +114,11 @@ if __name__ == "__main__":
 
     # TODO Start training
     psnr_erro = np.inf
+
     for epoch_idx in range(cfg.SOLVER.EPOCHS):
         #  TODO train
-        for batch_idx, sample in enumerate(TrainImgLoader):
+        loop = tqdm((TrainImgLoader), total=len(TrainImgLoader))
+        for batch_idx, sample in enumerate(loop):
             #  TODO set up learning rate
             global_step = ((len(TrainImgLoader) * epoch_idx + batch_idx) * cfg.SOLVER.BATCH_SIZE * num_gpus)
             if global_step > cfg.SOLVER.STEPS:
@@ -134,8 +131,17 @@ if __name__ == "__main__":
             item, loss = train_one_epoch(sample, model, model_optimizer, [adapter_model, adapter_optimizer], loss_class,
                                          onsuper=True, isTrain=True)
             writer.add_scalar("train_loss", loss.item(), global_step=epoch_idx*10 + batch_idx, walltime=None)
-            #writer.add_image('features1', grid1, global_step=epoch)
-            print("train liss: {}".format(loss.item()))
+            writer.add_scalar("adapter_lr", adapter_optimizer.param_groups[0]["lr"],
+                              global_step=epoch_idx * 10 + batch_idx, walltime=None)
+            writer.add_scalar("model_lr", model_optimizer.param_groups[0]["lr"],
+                              global_step=epoch_idx * 10 + batch_idx, walltime=None)
+            if batch_idx == 20:
+                pred_depth = ((item["baseline"] * item["flocal_length"]) / item["pred_disp"]).detach().cpu().data[0, 0, :, :]
+                depth = item["depth"].detach().cpu().data[0, 0, :, :]
+                writer.add_image('train_depth', depth, global_step=epoch_idx, dataformats='HW')
+                writer.add_image('train_pred_depth', pred_depth, global_step=epoch_idx, dataformats='HW')
+            loop.set_description(f'Epoch [{epoch_idx}/{cfg.SOLVER.EPOCHS}]')
+            loop.set_postfix(train_loss=loss.item())
 
             #  TODO save checkpoints
             if global_step % cfg.SOLVER.SAVE_FREQ == 0:
@@ -151,16 +157,18 @@ if __name__ == "__main__":
         gc.collect()
 
         #  TODO val
-        for batch_idx, sample in enumerate(ValImgLoader):
+        loop = tqdm((ValImgLoader), total=len(ValImgLoader))
+        for batch_idx, sample in enumerate(loop):
             global_step = (len(ValImgLoader) * epoch_idx + batch_idx) * cfg.SOLVER.BATCH_SIZE
             do_summary = global_step % cfg.SOLVER.SUMMARY_FREQ == 0
             item, loss = train_one_epoch(sample, model, model_optimizer, [adapter_model, adapter_optimizer], loss_class,
                                          onsuper=False, isTrain=False)
             writer.add_scalar("val_loss", loss.item(), global_step=epoch_idx * 10 + batch_idx, walltime=None)
-
-            pred_depth = ((item["baseline"] * item["flocal_length"]) / item["pred_disp"]).detach().cpu().data[0, 0, :, :]
-            depth = item["depth"].detach().cpu().data[0, 0, :, :]
-
-            print("val loss: {}".format(loss.item()))
-
+            if batch_idx == 20:
+                pred_depth = ((item["baseline"] * item["flocal_length"]) / item["pred_disp"]).detach().cpu().data[0, 0, :, :]
+                depth = item["depth"].detach().cpu().data[0, 0, :, :]
+                writer.add_image('val_depth', depth, global_step=epoch_idx, dataformats='HW')
+                writer.add_image('val_pred_depth', pred_depth, global_step=epoch_idx, dataformats='HW')
+            loop.set_description(f'Epoch [{epoch_idx}/{cfg.SOLVER.EPOCHS}]')
+            loop.set_postfix(val_loss=loss.item())
         gc.collect()
