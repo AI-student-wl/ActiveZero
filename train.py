@@ -6,9 +6,14 @@ import numpy as np
 from tensorboardX import SummaryWriter
 
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DistributedSampler
+
+import torch.backends.cudnn as cudnn
 from datasets.messytable import Depth_IR, DataLoader
 from configs.config import cfg
-from utils.reduce import set_random_seed
+from utils.reduce import set_random_seed, synchronize
 from utils.util import adjust_learning_rate, setup_logger
 from utils.losses import computer_loss
 from nets.adapter import Adapter
@@ -20,6 +25,16 @@ def get_args():
     parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args()
     return args
+
+def init_dist(args):
+    num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+    is_distributed = num_gpus > 1
+    if is_distributed:
+        torch.cuda.set_device(args.local_rank)
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        synchronize()
+    cuda_device = torch.device("cuda:{}".format(args.local_rank))
+    return cuda_device, num_gpus, is_distributed
 
 
 def init_model(backbone, cfg):
@@ -82,7 +97,7 @@ if __name__ == "__main__":
     writer = SummaryWriter('runs/onsuper')
     #  set up device and seed
     set_random_seed(cfg.SOLVER.SEED)
-    cuda_device, num_gpus, is_distributed = torch.device("{}".format(args.device)), 1, False
+    cuda_device, num_gpus, is_distributed = init_dist(args)
 
     os.makedirs(cfg.SOLVER.LOGDIR, exist_ok=True)
     os.makedirs(os.path.join(cfg.SOLVER.LOGDIR, "models"), exist_ok=True)
@@ -94,20 +109,25 @@ if __name__ == "__main__":
     logger.info(f"Running with {num_gpus} GPUs")
 
 
-    # TODO dataloader
+    # TODO dataset dist
     train_dataset = Depth_IR(cfg.SIM.TRAIN, cfg)
     val_dataset = Depth_IR(cfg.SIM.VAL, cfg)
-    TrainImgLoader = DataLoader(train_dataset, batch_size=cfg.SOLVER.BATCH_SIZE, shuffle=True, num_workers=cfg.SOLVER.NUM_WORKER, drop_last=True)
-    ValImgLoader = DataLoader(val_dataset, batch_size=cfg.SOLVER.BATCH_SIZE, shuffle=False, num_workers=cfg.SOLVER.NUM_WORKER, drop_last=False)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank())
+    val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank())
+    TrainImgLoader = DataLoader(train_dataset, cfg.SOLVER.BATCH_SIZE, sampler=train_sampler,
+                                num_workers=cfg.SOLVER.NUM_WORKER, drop_last=True, pin_memory=True)
+    ValImgLoader = DataLoader(val_dataset, cfg.SOLVER.BATCH_SIZE, sampler=val_sampler,
+                              num_workers=cfg.SOLVER.NUM_WORKER, drop_last=False, pin_memory=True)
 
-    # TODO Create Adapter model
+
+    # TODO set up model dist
     adapter_model = Adapter().to(cuda_device)
     adapter_optimizer = torch.optim.Adam(adapter_model.parameters(), lr=cfg.SOLVER.LR, betas=(0.9, 0.999))
-
-    # TODO load backbone
+    adapter_model = DDP(adapter_model, device_ids=[args.local_rank], output_device=args.local_rank)
     backbone = cfg.MODEL.BACKBONE
     model = init_model(backbone, cfg)
     model_optimizer = torch.optim.Adam(model.parameters(), lr=cfg.SOLVER.LR, betas= cfg.SOLVER.BETAS)
+    model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
 
     #  TODO  loss function
     loss_class = computer_loss(model, adapter_model)
@@ -130,30 +150,32 @@ if __name__ == "__main__":
 
             item, loss = train_one_epoch(sample, model, model_optimizer, [adapter_model, adapter_optimizer], loss_class,
                                          onsuper=True, isTrain=True)
-            writer.add_scalar("train_loss", loss.item(), global_step=epoch_idx*10 + batch_idx, walltime=None)
-            writer.add_scalar("adapter_lr", adapter_optimizer.param_groups[0]["lr"],
-                              global_step=epoch_idx * 10 + batch_idx, walltime=None)
-            writer.add_scalar("model_lr", model_optimizer.param_groups[0]["lr"],
-                              global_step=epoch_idx * 10 + batch_idx, walltime=None)
-            if batch_idx == 20:
-                pred_depth = ((item["baseline"] * item["flocal_length"]) / item["pred_disp"]).detach().cpu().data[0, 0, :, :]
-                depth = item["depth"].detach().cpu().data[0, 0, :, :]
-                writer.add_image('train_depth', depth, global_step=epoch_idx, dataformats='HW')
-                writer.add_image('train_pred_depth', pred_depth, global_step=epoch_idx, dataformats='HW')
+            if dist.get_rank() == 0:
+                writer.add_scalar("train_loss", loss.item(), global_step=epoch_idx*10 + batch_idx, walltime=None)
+                writer.add_scalar("adapter_lr", adapter_optimizer.param_groups[0]["lr"],
+                                  global_step=epoch_idx * 10 + batch_idx, walltime=None)
+                writer.add_scalar("model_lr", model_optimizer.param_groups[0]["lr"],
+                                  global_step=epoch_idx * 10 + batch_idx, walltime=None)
+                if batch_idx == 20:
+                    pred_depth = ((item["baseline"] * item["flocal_length"]) / item["pred_disp"]).detach().cpu().data[0, 0, :, :]
+                    depth = item["depth"].detach().cpu().data[0, 0, :, :]
+                    writer.add_image('train_depth', depth, global_step=epoch_idx, dataformats='HW')
+                    writer.add_image('train_pred_depth', pred_depth, global_step=epoch_idx, dataformats='HW')
             loop.set_description(f'Epoch [{epoch_idx}/{cfg.SOLVER.EPOCHS}]')
             loop.set_postfix(train_loss=loss.item())
 
             #  TODO save checkpoints
-            if global_step % cfg.SOLVER.SAVE_FREQ == 0:
-                checkpoint_data = {
-                    "epoch": epoch_idx,
-                    "model": model.state_dict(),
-                    "model_optimizer": model_optimizer.state_dict(),
-                    "adapter": adapter_model.state_dict(),
-                    "adapter_optimizer": adapter_optimizer.state_dict()
-                }
-                save_filename = os.path.join(cfg.SOLVER.LOGDIR, "models", f"model_{global_step}.pth")
-                torch.save(checkpoint_data, save_filename)
+            if (not is_distributed) or (dist.get_rank() == 0):
+                if global_step % cfg.SOLVER.SAVE_FREQ == 0:
+                    checkpoint_data = {
+                        "epoch": epoch_idx,
+                        "model": model.state_dict(),
+                        "model_optimizer": model_optimizer.state_dict(),
+                        "adapter": adapter_model.state_dict(),
+                        "adapter_optimizer": adapter_optimizer.state_dict()
+                    }
+                    save_filename = os.path.join(cfg.SOLVER.LOGDIR, "models", f"model_{global_step}.pth")
+                    torch.save(checkpoint_data, save_filename)
         gc.collect()
 
         #  TODO val
@@ -163,12 +185,13 @@ if __name__ == "__main__":
             do_summary = global_step % cfg.SOLVER.SUMMARY_FREQ == 0
             item, loss = train_one_epoch(sample, model, model_optimizer, [adapter_model, adapter_optimizer], loss_class,
                                          onsuper=False, isTrain=False)
-            writer.add_scalar("val_loss", loss.item(), global_step=epoch_idx * 10 + batch_idx, walltime=None)
-            if batch_idx == 20:
-                pred_depth = ((item["baseline"] * item["flocal_length"]) / item["pred_disp"]).detach().cpu().data[0, 0, :, :]
-                depth = item["depth"].detach().cpu().data[0, 0, :, :]
-                writer.add_image('val_depth', depth, global_step=epoch_idx, dataformats='HW')
-                writer.add_image('val_pred_depth', pred_depth, global_step=epoch_idx, dataformats='HW')
-            loop.set_description(f'Epoch [{epoch_idx}/{cfg.SOLVER.EPOCHS}]')
-            loop.set_postfix(val_loss=loss.item())
+            if dist.get_rank() == 0:
+                writer.add_scalar("val_loss", loss.item(), global_step=epoch_idx * 10 + batch_idx, walltime=None)
+                if batch_idx == 20:
+                    pred_depth = ((item["baseline"] * item["flocal_length"]) / item["pred_disp"]).detach().cpu().data[0, 0, :, :]
+                    depth = item["depth"].detach().cpu().data[0, 0, :, :]
+                    writer.add_image('val_depth', depth, global_step=epoch_idx, dataformats='HW')
+                    writer.add_image('val_pred_depth', pred_depth, global_step=epoch_idx, dataformats='HW')
+                loop.set_description(f'Epoch [{epoch_idx}/{cfg.SOLVER.EPOCHS}]')
+                loop.set_postfix(val_loss=loss.item())
         gc.collect()
