@@ -4,171 +4,74 @@ import torch.nn.functional as F
 import torch
 import numpy as np
 
-def psmnet_disp(pred_disp, disp_gt_l, mask):
+def psmnet_disp(pred_disp, disp_gt, mask):
     pred_disp3, pred_disp2, pred_disp1 = pred_disp
-    loss_disp = (
-        0.5 * F.smooth_l1_loss(pred_disp1[mask], disp_gt_l[mask], reduction="mean")
-        + 0.7
-        * F.smooth_l1_loss(pred_disp2[mask], disp_gt_l[mask], reduction="mean")
-        + F.smooth_l1_loss(pred_disp3[mask], disp_gt_l[mask], reduction="mean")
-    )
+    loss_disp = (0.5 * F.smooth_l1_loss(pred_disp1[mask], disp_gt[mask], reduction="mean")
+                 + 0.7 * F.smooth_l1_loss(pred_disp2[mask], disp_gt[mask], reduction="mean")
+                 + F.smooth_l1_loss(pred_disp3[mask], disp_gt[mask], reduction="mean"))
     return loss_disp
 
-def dispnet_disp(disp_ests, disp_gt, mask):
-    scale = [0, 1, 2, 3, 4, 5, 6]
-    weights = [1, 1, 1, 0.8, 0.6, 0.4, 0.2]
-    all_losses = []
-    for disp_est, weight, s in zip(disp_ests, weights, scale):
-        if s != 0:
-            dgt = F.interpolate(disp_gt, scale_factor=1 / (2 ** s))
-            m = F.interpolate(mask.float(), scale_factor=1 / (2 ** s)).byte()
-        else:
-            dgt = disp_gt
-            m = mask
-        all_losses.append(
-            weight
-            * F.smooth_l1_loss(disp_est[m], dgt[m], size_average=True, reduction="mean")
-        )
-    return sum(all_losses)
-
-def sequence_loss(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700):
-
-    """Loss function defined over sequence of flow predictions"""
-
-    n_predictions = len(flow_preds)
-    assert n_predictions >= 1
-    flow_loss = 0.0
-
-    flow_gt = - flow_gt # convert from disp_gt to flow_gt
-
-    # exlude invalid pixels and extremely large diplacements
-    mag = torch.sum(flow_gt ** 2, dim=1).sqrt()
-
-    # exclude extremly large displacements
-    valid = (valid >= 0.5) & (mag < max_flow).unsqueeze(1)  # [bs, 1, H, W]
-    assert valid.shape == flow_gt.shape, [valid.shape, flow_gt.shape]
-    assert not torch.isinf(flow_gt[valid.bool()]).any()
-
-    for i in range(n_predictions):
-        assert (
-            not torch.isnan(flow_preds[i]).any()
-            and not torch.isinf(flow_preds[i]).any()
-        )
-        # We adjust the loss_gamma so it is consistent for any number of RAFT-Stereo iterations
-        adjusted_loss_gamma = loss_gamma ** (15 / (n_predictions - 1))
-        i_weight = adjusted_loss_gamma ** (n_predictions - i - 1)
-        i_loss = (flow_preds[i] - flow_gt).abs()
-        assert i_loss.shape == valid.shape, [
-            i_loss.shape,
-            valid.shape,
-            flow_gt.shape,
-            flow_preds[i].shape,
-        ]
-        flow_loss += i_weight * i_loss[valid.bool()].mean()
-
-    return flow_loss
-
-def default_disp(pred_disp, disp_gt_l, mask):
-    return F.smooth_l1_loss(pred_disp[mask], disp_gt_l[mask], reduction="mean")
-
-class AllLosses():
-    def __init__(self, model, name, adapter=True):
+class computer_loss():
+    def __init__(self, model, adapter):
         self.model = model
-        self.name = name
         self.adapter = adapter
+        self.onsuper = None
+        self.isTrain = None
 
-    # compute total loss
-    def compute_loss(self, item, onSim=True, train=True):
+    def computer(self, item, onsuper=True, isTrain=True):
+        self.onsuper = onsuper
+        self.isTrain = isTrain
         loss = 0
-        loss_vals = {}
-        loss_disp, item = self.compute_disp_loss(item, onSim, train)
-
-        if (cfg.LOSSES.DISP_LOSS and onSim):  #  True and onsim
-            loss += loss_disp
-            loss_vals['disp'] = loss_disp.item()
-        if (cfg.LOSSES.REPROJECTION_LOSS):  # True
+        loss_disp, item = self.compute_disp_loss(item)
+        loss = loss + loss_disp
+        if self.onsuper:
+            loss_reproj, item = self.compute_reprojection_loss(item)
+            loss += cfg.LOSSES.REPROJECTION.SIMRATIO * loss_reproj
+        else:
             loss_reproj, item = self.compute_reprojection_loss(item)
             loss += cfg.LOSSES.REPROJECTION.REALRATIO * loss_reproj
-            loss_vals['reproject'] = loss_reproj.item()
-        return loss, item, loss_vals
+        return loss, item
 
-    def forward(self, item, train=True):
-        type = self.name
-        if train:
-            if self.adapter and type=="psmnet":
-                output = self.model(item['img_real_L'], item['img_real_R'], item['img_real_L_transformed'], item['img_real_R_transformed'])
-                pred_disp = output[0]
-            elif type=="psmnet":
-                output = self.model(item['img_real_L'], item['img_real_R'])
-                pred_disp = output[0]
-            elif type=="dispnet":
-                input = torch.cat((item['img_real_L'], item['img_real_R']),dim=1)
-                output = self.model(input)
-                pred_disp = output[0]
-            elif type=="raft":
-                output = self.model(item['img_real_L'], item['img_real_R'], iters=cfg.MODEL.TRAIN_ITERS)
-                pred_disp = -output[-1]
+    def compute_reprojection_loss(self, item):
+        if self.onsuper:
+            reproj_loss = F.smooth_l1_loss(item["disp"], item["pred_disp"])
+        else:
+            real_ir_reproj_loss, real_ir_warped, real_ir_reproj_mask = get_reproj_error_patch(
+                input_L=item['img_L'],
+                input_R=item['img_R'],
+                pred_disp_l=item['pred_disp'],
+                ps=cfg.LOSSES.REPROJECTION.PATCH_SIZE,
+            )
+            item['ir_warped'] = real_ir_warped
+            item['ir_reproj_mask'] = real_ir_reproj_mask
+            reproj_loss = real_ir_reproj_loss
+        return reproj_loss, item
+    def forward(self, item):
+        if self.isTrain:
+            output = self.model(item['img_L'], item['img_R'], item['img_L_transformed'], item['img_R_transformed'])
+            pred_disp = output[0]
         else:
             with torch.no_grad():
-                if self.adapter and type=="psmnet":
-                    pred_disp = self.model(
-                        item['img_real_L'], item['img_real_R'], item['img_real_L_transformed'],
-                        item['img_real_R_transformed'])
-                    output = pred_disp
-                elif type=="psmnet":
-                    pred_disp = self.model(item['img_real_L'], item['img_real_R'])
-                    output = pred_disp
-                elif type=="dispnet":
-                    input = torch.cat((item['img_real_L'], item['img_real_R']), dim=1)
-                    output = self.model(input)
-                    pred_disp = output[0]
-                elif type=="raft":
-                    output = self.model(item['img_real_L'], item['img_real_R'], iters=cfg.MODEL.TRAIN_ITERS)
-                    pred_disp = -output[-1]
+                pred_disp = self.model(item['img_L'], item['img_R'], item['img_L_transformed'],item['img_R_transformed'])
+                output = pred_disp
 
         return output, pred_disp
 
-    def compute_reprojection_loss(self, item):
-        ir_reproj_loss, ir_warped, ir_reproj_mask = get_reproj_error_patch(
-            input_L=item['img_L_no_norm'],
-            input_R=item['img_R_no_norm'],
-            pred_disp_l=item['disp'],
-            ps=cfg.LOSSES.REPROJECTION.PATCH_SIZE,
-        )
-        item['real_ir_warped'] = ir_warped
-        item['real_ir_reproj_mask'] = ir_reproj_mask
-        reproj_loss = ir_reproj_loss
-        return reproj_loss, item
-
-    def compute_disp_loss(self, item, onSim, train):
-        """
-        onsim == True is suprt train
-        onsim == False is unsuper train
-        """
-        mask = item['depth'] > 0
+    def compute_disp_loss(self, item):
+        mask = item["depth"] > 0
         func = psmnet_disp
-        # for disparity loss during training on sim
         loss_disp = 0
-        if onSim:
-            disp = item['disp']
-            values = {'img_real_L': item['img_real_L'], 'img_real_R': item['img_real_R']}
-            if self.adapter:
-                values['img_real_L_transformed'] = item['img_real_L_transformed']
-                values['img_real_R_transformed'] = item['img_real_R_transformed']
-            output, pred_disp = self.forward(values, train)
-            loss_disp = func(output, disp, mask)
-            item['super_pred_disp'] = pred_disp
-
-        # for disparity during training on real
-        elif not onSim:
-            values = {
-                'img_L': item['img_real_L'],
-                'img_R': item['img_real_R'],
-            }
-            if self.adapter:
-                values['img_real_L_transformed'] = item['img_real_L_transformed']
-                values['img_real_R_transformed'] = item['img_real_R_transformed']
-            output, pred_disp = self.forward(values, train)
-            item['unsuper_pred_disp'] = pred_disp
+        values = {'img_L': item['img_L'], 'img_R': item['img_R'],
+                  'img_L_transformed': item['img_L_transformed'],
+                  'img_R_transformed': item['img_R_transformed']}
+        if self.onsuper:
+            disp_gt = item['disp']
+            output, pred_disp = self.forward(values)
+            loss_disp = func(output, disp_gt, mask)
+            item['pred_disp'] = pred_disp
+        else:
+            output, pred_disp = self.forward(values)
+            item['pred_disp'] = pred_disp
         return loss_disp, item
+
 
